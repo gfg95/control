@@ -1,0 +1,57 @@
+:root {
+	/* Finition de l'instrument : coque aluminium clair, légendes à l'encre, un seul signal cobalt. */
+	--coque: #dcddd6;
+	--coque-claire: #ecede7;
+	--creux: #c6c8c0;
+	--plan: #b3b6ad;
+	--encre: #1d2126;
+	--encre-douce: #555b62;
+	--filet: rgb(29 33 38 / 0.2);
+	--ivoire: #faf8f1;
+	--ivoire-ombre: #e2dece;
+	--ebene: #23262b;
+	--ebene-reflet: #3c4148;
+	--cobalt: #2146e8;
+	--cobalt-clair: #6a85f7;
+	--lampe-active: #17935a;
+	--lampe-attente: #d98a00;
+
+	--police: 'Barlow Semi Condensed', 'Arial Narrow', system-ui, sans-serif;
+
+	color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+}
+
+body {
+	background: var(--plan);
+	color: var(--encre);
+	font-family: var(--police);
+	font-weight: 500;
+	font-size: 15px;
+	line-height: 1.3;
+	font-variant-numeric: tabular-nums;
+	-webkit-text-size-adjust: 100%;
+	-webkit-tap-highlight-color: transparent;
+	overscroll-behavior: none;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+}
+
+:focus-visible {
+	outline: 2px solid var(--cobalt);
+	outline-offset: 2px;
+}
