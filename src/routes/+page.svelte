@@ -4,7 +4,8 @@
 	import Keyboard from '#lib/Keyboard.svelte';
 	import Knob from '#lib/Knob.svelte';
 	import Sheet from '#lib/Sheet.svelte';
-	import { COMPUTER_KEYS, FM_PARAMS, KEY_COUNT, ccName, fmParam, formatReal, noteName } from '#lib/midi.ts';
+	import { COMPUTER_KEYS, KEY_COUNT, ccName, formatValue, noteName, synthLabel } from '#lib/midi.ts';
+	import { DRUM_BANK, type TseChannel, type TsePreset } from '#lib/tse.ts';
 
 	// Mêmes requêtes que dans le CSS ci-dessous.
 	const COMPACT_QUERY =
@@ -13,7 +14,7 @@
 
 	type Tab = 'controls' | 'synth';
 	type SheetState =
-		| { kind: 'channel' }
+		| { kind: 'target' }
 		| { kind: 'program' }
 		| { kind: 'assign'; index: number }
 		| null;
@@ -71,10 +72,31 @@
 		}
 	});
 
+	/** La cible, telle que l'iframe l'annonce. */
+	const current = $derived(ctl.synths.find((synth) => synth.id === ctl.target) ?? null);
+	const label = $derived(synthLabel(ctl.bank));
+	const font = $derived(ctl.soundfont);
+	const fontPercent = $derived(Math.round((font?.progress ?? 0) * 100));
+	// Le moteur n'annonce pas chaque pour-cent : sans progression connue, pas de chiffre.
+	const fontLabel = $derived(fontPercent > 0 ? `SoundFont ${fontPercent} %` : 'SoundFont…');
+
+	function channelName(channel: TseChannel): string {
+		return channel === 'omni' ? 'omni' : String(channel);
+	}
+
 	const audio = $derived.by(() => {
 		if (ctl.link === 'loading') return { label: 'Connexion…', lamp: 'off', idle: true };
 		if (ctl.link === 'error') return { label: 'Réessayer', lamp: 'wait', idle: false };
-		if (ctl.running) return { label: 'Son actif', lamp: 'on', idle: true };
+		if (ctl.running) {
+			// Une cible à SoundFont reste muette tant que celle-ci n'est pas chargée.
+			if (ctl.table?.soundfont && font?.state === 'loading') {
+				return { label: fontLabel, lamp: 'wait', idle: true };
+			}
+			if (ctl.table?.soundfont && font?.state === 'error') {
+				return { label: 'SoundFont en échec', lamp: 'wait', idle: true };
+			}
+			return { label: 'Son actif', lamp: 'on', idle: true };
+		}
 		if (ctl.needsGesture) return { label: 'Son bloqué', lamp: 'wait', idle: false };
 		return { label: 'Activer le son', lamp: 'off', idle: false };
 	});
@@ -88,11 +110,59 @@
 	const display = $derived.by(() => {
 		if (ctl.touched === null) return null;
 		const knob = ctl.knobs[ctl.touched];
-		const param = fmParam(knob.cc);
-		return { name: ccName(knob.cc), value: param ? formatReal(param, knob.value) : String(knob.value) };
+		if (!knob) return null;
+		const param = ctl.param(knob.cc);
+		return {
+			name: ccName(ctl.bank, knob.cc),
+			value: (param && formatValue(param, knob.value)) || String(knob.value)
+		};
 	});
 
-	const assigning = $derived(sheet?.kind === 'assign' ? ctl.knobs[sheet.index] : null);
+	/** Erreur signalée par le moteur, en clair. */
+	const trouble = $derived.by(() => {
+		if (!ctl.error) return null;
+		return ctl.error.code === 'protocol_mismatch'
+			? 'Le script et le synthé ne sont pas de la même version : rechargez la page.'
+			: ctl.error.message;
+	});
+
+	// ── Instruments de la cible (feuille Programme) ───────────────────────────
+	let query = $state('');
+
+	/** Minuscules sans accents, pour chercher « piano » comme « Piano ». */
+	function fold(text: string): string {
+		return text.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+	}
+
+	function bankTitle(bank: number): string {
+		if (bank === 0) return 'Instruments';
+		return bank === DRUM_BANK ? 'Batteries' : `Banque ${bank}`;
+	}
+
+	/** La liste filtrée par la recherche (nom ou numéro de programme), une section par banque. */
+	const presetGroups = $derived.by(() => {
+		const wanted = fold(query.trim());
+		const groups: { bank: number; title: string; presets: TsePreset[] }[] = [];
+		for (const preset of ctl.instruments) {
+			if (wanted && !fold(preset.name).includes(wanted) && String(preset.program) !== wanted) continue;
+			const last = groups.at(-1);
+			if (last?.bank === preset.bank) last.presets.push(preset);
+			else groups.push({ bank: preset.bank, title: bankTitle(preset.bank), presets: [preset] });
+		}
+		return groups;
+	});
+
+	function same(a: TsePreset | null, b: TsePreset): boolean {
+		return a !== null && a.bank === b.bank && a.program === b.program;
+	}
+
+	/** À l'ouverture de la feuille, amène l'instrument courant au milieu de la liste. */
+	function reveal(node: HTMLElement, current: boolean) {
+		if (current) node.scrollIntoView({ block: 'center', inline: 'nearest' });
+	}
+
+	const assigning = $derived(sheet?.kind === 'assign' ? (ctl.knobs[sheet.index] ?? null) : null);
+	const assigned = $derived(assigning ? ctl.param(assigning.cc) : undefined);
 
 	async function toggleFullscreen() {
 		try {
@@ -142,7 +212,7 @@
 	<title>Control — clavier MIDI</title>
 	<meta
 		name="description"
-		content="Clavier contrôleur MIDI 25 touches avec 8 potentiomètres assignables et Program Change, branché sur le synthé FM de TabSoundEngine."
+		content="Clavier contrôleur MIDI 25 touches avec 8 potentiomètres assignables et Program Change, branché sur les synthés GM, FM et soustractif de TabSoundEngine."
 	/>
 </svelte:head>
 
@@ -171,18 +241,32 @@
 				>
 			</div>
 
-			<button type="button" class="cap" onclick={() => (sheet = { kind: 'channel' })}>
-				Canal <strong>{ctl.channel}</strong>
+			<button
+				type="button"
+				class="cap"
+				aria-label="Cible : {label}{current ? `, canal ${channelName(current.channel)}` : ''}"
+				onclick={() => (sheet = { kind: 'target' })}
+			>
+				<span class="wide-label">Cible</span>
+				<strong>{label}{current ? ` · ${channelName(current.channel)}` : ''}</strong>
 			</button>
 
 			<button
 				type="button"
 				class="cap"
-				aria-label="Program Change, programme {ctl.program}"
-				onclick={() => (sheet = { kind: 'program' })}
+				aria-label={ctl.preset
+					? `Instrument : ${ctl.preset.name}, programme ${ctl.program}`
+					: `Program Change, programme ${ctl.program}`}
+				onclick={() => {
+					query = '';
+					sheet = { kind: 'program' };
+				}}
 			>
 				<span class="wide-label">Programme</span><span class="short-label">PC</span>
 				<strong>{ctl.program}</strong>
+				{#if ctl.preset}
+					<span class="wide-label instrument">{ctl.preset.name}</span>
+				{/if}
 			</button>
 
 			<div class="octave" role="group" aria-label="Octave du clavier">
@@ -205,8 +289,10 @@
 				>
 			</div>
 
-			<p class="display">
-				{#if display}
+			<p class="display" class:alert={!!trouble} title={trouble}>
+				{#if trouble}
+					<span role="alert">{trouble}</span>
+				{:else if display}
 					<span>{display.name}</span> <strong>{display.value}</strong>
 				{/if}
 			</p>
@@ -257,12 +343,36 @@
 							<p>Le synthé ne répond pas. Vérifiez la connexion internet, puis réessayez.</p>
 							<button type="button" class="cap" onclick={() => ctl.retry()}>Réessayer</button>
 						</div>
+					{:else if font?.state === 'loading'}
+						<div
+							class="gauge"
+							class:unknown={fontPercent === 0}
+							role="progressbar"
+							aria-label="Chargement de la SoundFont du GM"
+							aria-valuemin={0}
+							aria-valuemax={100}
+							aria-valuenow={fontPercent > 0 ? fontPercent : undefined}
+							style:--progress="{fontPercent}%"
+						></div>
 					{/if}
 				</div>
-				{#if ctl.needsGesture}
-					<p class="hint">
-						Le navigateur a bloqué le son. Touchez « Démarrer l'audio » dans le synthé.
-					</p>
+				{#if ctl.needsGesture || font?.state === 'error' || trouble}
+					<div class="notes">
+						{#if ctl.needsGesture}
+							<p class="hint">
+								Le navigateur a bloqué le son. Touchez « Démarrer l'audio » dans le synthé.
+							</p>
+						{/if}
+						{#if font?.state === 'error'}
+							<p class="hint">
+								La SoundFont n'a pas pu être chargée{font.error ? ` (${font.error})` : ''} : le GM
+								reste muet.
+							</p>
+						{/if}
+						{#if trouble}
+							<p class="hint">{trouble}</p>
+						{/if}
+					</div>
 				{/if}
 			</div>
 
@@ -277,6 +387,8 @@
 						{index}
 						cc={knob.cc}
 						value={knob.value}
+						param={ctl.param(knob.cc)}
+						initial={ctl.initial(knob.cc)}
 						{rotated}
 						onchange={(value) => ctl.setKnob(index, value)}
 						onassign={() => (sheet = { kind: 'assign', index })}
@@ -299,82 +411,177 @@
 	<p class="tips">
 		<span>
 			Au clavier d'ordinateur, la rangée du bas joue la première octave et la rangée du haut la
-			seconde. Cliquez sur le nom d'un potentiomètre pour changer son CC ; un double-clic sur le
-			potentiomètre le remet à sa valeur d'origine.
+			seconde. « Cible » choisit le synthé joué et son canal ; chaque synthé garde ses
+			8 potentiomètres. Cliquez sur le nom d'un potentiomètre pour changer son CC ; un double-clic
+			sur le potentiomètre le remet à sa valeur d'origine.
 		</span>
 	</p>
 
-	{#if sheet?.kind === 'channel'}
-		<Sheet title="Canal MIDI" onclose={() => (sheet = null)}>
-			<div class="channels">
-				{#each { length: 16 }, i (i)}
-					<button
-						type="button"
-						class="cap choice"
-						aria-pressed={ctl.channel === i + 1}
-						onclick={() => {
-							ctl.setChannel(i + 1);
-							sheet = null;
-						}}>{i + 1}</button
-					>
-				{/each}
-			</div>
+	{#if sheet?.kind === 'target'}
+		<Sheet title="Cible" onclose={() => (sheet = null)}>
+			{#if ctl.link !== 'ready'}
+				<p class="note">
+					{ctl.link === 'error' ? 'Le synthé ne répond pas.' : 'Connexion au synthé…'}
+				</p>
+			{:else}
+				<!-- La liste vient de l'état de l'iframe : un moteur plus récent peut en annoncer d'autres. -->
+				<div class="synths">
+					{#each ctl.synths as synth (synth.id)}
+						<button
+							type="button"
+							class="cap choice two-lines"
+							aria-pressed={synth.id === ctl.target}
+							onclick={() => ctl.setTarget(synth.id)}
+						>
+							<span>{synth.label}</span>
+							<small>{synth.name} · canal {channelName(synth.channel)}</small>
+						</button>
+					{/each}
+					{#each ctl.absent as synth (synth.id)}
+						<button type="button" class="cap choice two-lines" disabled>
+							<span>{synth.label}</span>
+							<small>absent de ce moteur</small>
+						</button>
+					{/each}
+				</div>
+
+				{#if current}
+					<h3 class="section">Canal écouté par {current.label}</h3>
+					<div class="channels">
+						{#each { length: 16 }, i (i)}
+							<button
+								type="button"
+								class="cap choice"
+								aria-pressed={current.channel === i + 1}
+								onclick={() => ctl.setChannel(i + 1)}>{i + 1}</button
+							>
+						{/each}
+						<button
+							type="button"
+							class="cap choice omni"
+							aria-pressed={current.channel === 'omni'}
+							onclick={() => ctl.setChannel('omni')}>Omni : tous les canaux</button
+						>
+					</div>
+					<p class="note">
+						Le clavier et les potentiomètres émettent sur le canal {ctl.sendChannel}.
+						{#if ctl.layered.length > 0}
+							{ctl.layered.map((synth) => synth.label).join(' et ')}
+							{ctl.layered.length > 1 ? 'entendent' : 'entend'} aussi ce canal : les sons se
+							superposent, et chaque synthé lit les CC dans sa propre table.
+						{/if}
+						{#if ctl.table?.drumChannel}
+							Sur le canal {ctl.table.drumChannel}, {current.label} joue la batterie.
+						{/if}
+					</p>
+				{/if}
+			{/if}
 		</Sheet>
 	{:else if sheet?.kind === 'program'}
-		<Sheet title="Program Change" onclose={() => (sheet = null)}>
+		{@const named = ctl.instruments.length > 0}
+		<Sheet
+			title="{named ? 'Instrument' : 'Program Change'} · {label}"
+			wide={named}
+			onclose={() => (sheet = null)}
+		>
 			{#snippet actions()}
+				{#if named}
+					<input
+						class="search"
+						type="search"
+						placeholder="Chercher"
+						aria-label="Chercher un instrument par son nom ou son numéro"
+						autocomplete="off"
+						spellcheck="false"
+						bind:value={query}
+					/>
+				{/if}
 				<button
 					type="button"
 					class="cap step"
-					aria-label="Programme précédent"
-					disabled={ctl.program <= 0}
-					onclick={() => ctl.setProgram(ctl.program - 1)}>−</button
+					aria-label={named ? 'Instrument précédent' : 'Programme précédent'}
+					disabled={named ? same(ctl.preset, ctl.instruments[0]) : ctl.program <= 0}
+					onclick={() => ctl.stepProgram(-1)}>−</button
 				>
 				<button
 					type="button"
 					class="cap step"
-					aria-label="Programme suivant"
-					disabled={ctl.program >= 127}
-					onclick={() => ctl.setProgram(ctl.program + 1)}>+</button
+					aria-label={named ? 'Instrument suivant' : 'Programme suivant'}
+					disabled={named ? same(ctl.preset, ctl.instruments[ctl.instruments.length - 1]) : ctl.program >= 127}
+					onclick={() => ctl.stepProgram(1)}>+</button
 				>
 			{/snippet}
-			<!-- La feuille reste ouverte : chaque case émet tout de suite, pour essayer les programmes à la suite. -->
-			<div class="programs">
-				{#each { length: 128 }, i (i)}
-					<button
-						type="button"
-						class="cap choice"
-						aria-pressed={ctl.program === i}
-						onclick={() => ctl.setProgram(i)}>{i}</button
-					>
+			<!-- La feuille reste ouverte : chaque case émet tout de suite, pour essayer les sons à la suite. -->
+			{#if named}
+				<!-- Les noms viennent de la SoundFont du synthé, par onPresets. -->
+				{#each presetGroups as group, i (group.bank)}
+					<h3 class="section" class:lead={i === 0}>{group.title}</h3>
+					<div class="presets">
+						{#each group.presets as preset (preset.program)}
+							<button
+								type="button"
+								class="cap choice preset"
+								title={preset.name}
+								aria-pressed={same(ctl.preset, preset)}
+								use:reveal={same(ctl.preset, preset)}
+								onclick={() => ctl.selectPreset(preset)}
+							>
+								<span class="number">{preset.program}</span>
+								<span class="name">{preset.name}</span>
+							</button>
+						{/each}
+					</div>
+				{:else}
+					<p class="note">Aucun instrument ne correspond à « {query.trim()} ».</p>
 				{/each}
-			</div>
+			{:else}
+				<div class="programs">
+					{#each { length: 128 }, i (i)}
+						<button
+							type="button"
+							class="cap choice"
+							aria-pressed={ctl.program === i}
+							onclick={() => ctl.setProgram(i)}>{i}</button
+						>
+					{/each}
+				</div>
+			{/if}
 			<p class="note">
-				Émis sur le canal {ctl.channel}.
-				{#if ctl.engine?.synth === 'fm'}
-					Le synthé FM ignore les Program Change : aucun effet sur le son.
+				{#if ctl.sendChannel !== null}
+					Émis sur le canal {ctl.sendChannel}, celui de {label}.
+				{/if}
+				{#if ctl.table?.program === false}
+					{label} ignore les Program Change : aucun effet sur le son.
+				{:else if named && ctl.onDrumChannel}
+					Sur ce canal, {label} ne joue que des kits de batterie.
+				{:else if !named && ctl.table?.soundfont}
+					{font?.state === 'error'
+						? "Sans SoundFont, pas de liste d'instruments."
+						: 'Les noms des instruments arrivent avec la SoundFont.'}
 				{/if}
 			</p>
 		</Sheet>
 	{:else if sheet?.kind === 'assign' && assigning}
 		{@const index = sheet.index}
-		<Sheet title="Potentiomètre {index + 1}" onclose={() => (sheet = null)}>
-			<div class="params">
-				{#each FM_PARAMS as param (param.cc)}
-					<button
-						type="button"
-						class="cap choice param"
-						aria-pressed={assigning.cc === param.cc}
-						onclick={() => {
-							ctl.assign(index, param.cc);
-							sheet = null;
-						}}
-					>
-						<span>{param.name}</span>
-						<small>CC {param.cc}</small>
-					</button>
-				{/each}
-			</div>
+		<Sheet title="Potentiomètre {index + 1} · {label}" onclose={() => (sheet = null)}>
+			{#if ctl.table}
+				<div class="params">
+					{#each ctl.table.params as param (param.cc)}
+						<button
+							type="button"
+							class="cap choice two-lines"
+							aria-pressed={assigning.cc === param.cc}
+							onclick={() => {
+								ctl.assign(index, param.cc);
+								sheet = null;
+							}}
+						>
+							<span>{param.name}</span>
+							<small>CC {param.cc}</small>
+						</button>
+					{/each}
+				</div>
+			{/if}
 			<div class="free">
 				<label for="free-cc">Autre numéro de CC</label>
 				<button
@@ -405,8 +612,16 @@
 					onclick={() => ctl.assign(index, assigning.cc + 1)}>+</button
 				>
 			</div>
-			{#if !fmParam(assigning.cc)}
-				<p class="note">Le synthé FM ignore le CC {assigning.cc} : le message est émis, sans effet sur le son.</p>
+			{#if !ctl.table}
+				<p class="note">
+					Le contrôleur ne connaît pas la table de CC de {label} : indiquez le numéro à émettre.
+				</p>
+			{:else if !assigned}
+				<p class="note">
+					{label} ignore le CC {assigning.cc} : le message est émis, sans effet sur le son.
+				</p>
+			{:else if assigned.note}
+				<p class="note">{assigned.note}</p>
 			{/if}
 		</Sheet>
 	{/if}
@@ -491,6 +706,15 @@
 		display: none;
 	}
 
+	/* Nom de l'instrument, à la suite de son numéro de programme. */
+	.instrument {
+		max-width: 12em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		font-weight: 500;
+		color: var(--encre-douce);
+	}
+
 	.step {
 		width: 36px;
 		padding: 0;
@@ -524,6 +748,13 @@
 	}
 
 	.display strong {
+		font-weight: 600;
+		color: var(--encre);
+	}
+
+	/* Une erreur du moteur se lit sur tous les écrans, pas seulement sur téléphone. */
+	.display.alert {
+		visibility: visible;
 		font-weight: 600;
 		color: var(--encre);
 	}
@@ -584,7 +815,7 @@
 		min-width: 0;
 	}
 
-	/* L'écran du synthé, encastré dans la coque. */
+	/* L'écran du synthé, encastré dans la coque : 150 px pour l'iframe, plus 6 px de bordure. */
 	.bezel {
 		position: relative;
 		height: 162px;
@@ -630,6 +861,52 @@
 
 	.veil .cap {
 		color: var(--encre);
+	}
+
+	/* Chargement de la SoundFont : un filet dans la bordure basse, sans recouvrir l'iframe. */
+	.gauge {
+		position: absolute;
+		left: 6px;
+		right: 6px;
+		bottom: 1.5px;
+		height: 3px;
+		border-radius: 2px;
+		background: rgb(255 255 255 / 0.16);
+		overflow: hidden;
+	}
+
+	.gauge::after {
+		content: '';
+		display: block;
+		width: var(--progress);
+		height: 100%;
+		background: var(--cobalt-clair);
+	}
+
+	/* Progression inconnue : un segment qui va et vient. */
+	.gauge.unknown::after {
+		width: 30%;
+		animation: sweep 1.4s ease-in-out infinite alternate;
+	}
+
+	@keyframes sweep {
+		to {
+			transform: translateX(233%);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.gauge.unknown::after {
+			width: 100%;
+			opacity: 0.5;
+			animation: none;
+		}
+	}
+
+	.notes {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
 	}
 
 	.hint {
@@ -678,6 +955,19 @@
 		color: #fff;
 	}
 
+	.synths {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+		gap: 6px;
+	}
+
+	.section {
+		margin: 14px 0 6px;
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--encre-douce);
+	}
+
 	.channels {
 		display: grid;
 		grid-template-columns: repeat(8, 1fr);
@@ -687,6 +977,11 @@
 	.channels .cap {
 		padding: 0;
 		height: 42px;
+	}
+
+	.channels .omni {
+		grid-column: 1 / -1;
+		height: 36px;
 	}
 
 	/* 128 programmes : 16 par rangée. */
@@ -703,13 +998,64 @@
 		font-size: 13px;
 	}
 
+	.search {
+		flex: 1 1 0;
+		min-width: 0;
+		height: 34px;
+		padding: 0 10px;
+		border: 1px solid var(--filet);
+		border-radius: 7px;
+		background: var(--ivoire);
+		color: var(--encre);
+		font: inherit;
+		/* 16px : en dessous, iOS zoome sur le champ à la prise de focus. */
+		font-size: 16px;
+		user-select: text;
+		-webkit-user-select: text;
+	}
+
+	/* La première section suit l'en-tête de la feuille, qui porte déjà sa marge. */
+	.section.lead {
+		margin-top: 0;
+	}
+
+	.presets {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+		gap: 3px;
+	}
+
+	.preset {
+		justify-content: flex-start;
+		gap: 7px;
+		height: 32px;
+		padding: 0 8px;
+		border-radius: 5px;
+		font-size: 14px;
+		font-weight: 500;
+	}
+
+	.preset .number {
+		flex: none;
+		min-width: 1.7em;
+		font-weight: 600;
+		text-align: right;
+		opacity: 0.7;
+	}
+
+	.preset .name {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
 	.params {
 		display: grid;
 		grid-template-columns: repeat(4, 1fr);
 		gap: 6px;
 	}
 
-	.param {
+	.two-lines {
 		flex-direction: column;
 		gap: 0;
 		height: 46px;
@@ -717,7 +1063,10 @@
 		line-height: 1.15;
 	}
 
-	.param small {
+	.two-lines small {
+		max-width: 100%;
+		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: 12px;
 		font-weight: 500;
 		opacity: 0.75;
@@ -887,8 +1236,9 @@
 			padding: 0;
 		}
 
+		/* 150 px pour l'iframe, plus sa bordure : son bouton « Démarrer l'audio » doit rester cliquable. */
 		.deck[data-tab='synth'] {
-			height: min(150px, 46%);
+			height: 164px;
 		}
 
 		.screen,
@@ -922,9 +1272,17 @@
 			font-size: 14px;
 		}
 
-		.hint {
+		.gauge {
+			left: 4px;
+			right: 4px;
+			bottom: 0.5px;
+		}
+
+		.notes {
 			flex: 0 0 170px;
 			align-self: center;
+			max-height: 100%;
+			overflow: auto;
 		}
 
 		.knobs {
@@ -957,12 +1315,24 @@
 		}
 
 		.channels .cap,
-		.param {
+		.two-lines {
 			height: 40px;
+		}
+
+		.channels .omni {
+			height: 34px;
+		}
+
+		.section {
+			margin: 10px 0 6px;
 		}
 
 		.programs .cap {
 			height: 28px;
+		}
+
+		.preset {
+			height: 34px;
 		}
 
 		.note {

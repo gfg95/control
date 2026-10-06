@@ -6,10 +6,12 @@
 		onclose: () => void;
 		/** Boutons placés dans l'en-tête, avant « Fermer ». */
 		actions?: Snippet;
+		/** Feuille élargie, pour une longue liste. */
+		wide?: boolean;
 		children: Snippet;
 	}
 
-	let { title, onclose, actions, children }: Props = $props();
+	let { title, onclose, actions, wide = false, children }: Props = $props();
 
 	let panel: HTMLDivElement;
 
@@ -36,7 +38,15 @@
 	role="presentation"
 	onpointerdown={(event) => event.target === event.currentTarget && onclose()}
 >
-	<div class="sheet" role="dialog" aria-modal="true" aria-label={title} tabindex="-1" bind:this={panel}>
+	<div
+		class="sheet"
+		class:wide
+		role="dialog"
+		aria-modal="true"
+		aria-label={title}
+		tabindex="-1"
+		bind:this={panel}
+	>
 		<header>
 			<h2>{title}</h2>
 			{@render actions?.()}
@@ -61,22 +71,31 @@
 		width: min(100%, 520px);
 		max-height: 100%;
 		overflow: auto;
-		padding: 12px 14px 14px;
+		padding: 0 14px 14px;
 		border-radius: 12px;
 		background: var(--coque);
 		box-shadow: 0 18px 50px rgb(0 0 0 / 0.35);
 		outline: none;
 	}
 
+	.sheet.wide {
+		width: min(100%, 720px);
+	}
+
+	/* L'en-tête reste en vue quand le contenu défile (longue liste d'instruments). */
 	header {
+		position: sticky;
+		top: 0;
+		z-index: 1;
 		display: flex;
 		align-items: center;
 		gap: 6px;
-		margin-bottom: 10px;
+		padding: 12px 0 10px;
+		background: var(--coque);
 	}
 
 	h2 {
-		flex: 1;
+		flex: 1 0 auto;
 		margin: 0;
 		font-size: 18px;
 		font-weight: 600;

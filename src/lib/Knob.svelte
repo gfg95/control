@@ -1,21 +1,24 @@
 <script lang="ts">
-	import { ccName, defaultValue, fmParam, formatReal } from './midi.ts';
+	import { choiceIndex, formatValue, type Param } from './midi.ts';
 
 	interface Props {
 		index: number;
 		cc: number;
 		value: number;
+		/** Paramètre que ce CC règle sur le synthé visé ; absent si le synthé l'ignore. */
+		param?: Param;
+		/** Valeur d'origine, rendue par un double-clic. */
+		initial: number;
 		/** L'interface est pivotée de 90° (téléphone tenu en portrait). */
 		rotated?: boolean;
 		onchange: (value: number) => void;
 		onassign: () => void;
 	}
 
-	let { index, cc, value, rotated = false, onchange, onassign }: Props = $props();
+	let { index, cc, value, param, initial, rotated = false, onchange, onassign }: Props = $props();
 
-	const param = $derived(fmParam(cc));
-	const name = $derived(ccName(cc));
-	const readout = $derived(param ? formatReal(param, value) : '');
+	const name = $derived(param?.name ?? `CC ${cc}`);
+	const readout = $derived(param ? formatValue(param, value) : '');
 	/** −135° à +135° autour de la verticale. */
 	const angle = $derived(-135 + (value / 127) * 270);
 
@@ -49,9 +52,17 @@
 		}
 	}
 
+	/** Avance de quelques crans. Sur un CC à positions (forme d'onde), un cran = la position voisine. */
+	function nudge(steps: number) {
+		const choices = param?.choices;
+		if (!choices) return onchange(value + steps);
+		const next = choices[choiceIndex(choices, value) + Math.sign(steps)];
+		if (next) onchange(next.send);
+	}
+
 	function wheel(event: WheelEvent) {
 		event.preventDefault();
-		onchange(value + (event.deltaY < 0 ? 1 : -1));
+		nudge(event.deltaY < 0 ? 1 : -1);
 	}
 
 	function keydown(event: KeyboardEvent) {
@@ -63,15 +74,11 @@
 			PageUp: 10,
 			PageDown: -10
 		};
-		if (event.key in steps) onchange(value + steps[event.key]);
+		if (event.key in steps) nudge(steps[event.key]);
 		else if (event.key === 'Home') onchange(0);
 		else if (event.key === 'End') onchange(127);
 		else return;
 		event.preventDefault();
-	}
-
-	function reset() {
-		onchange(defaultValue(cc) ?? 64);
 	}
 </script>
 
@@ -84,7 +91,7 @@
 		aria-valuemin={0}
 		aria-valuemax={127}
 		aria-valuenow={value}
-		aria-valuetext="{value}{param ? `, ${readout}` : ''}"
+		aria-valuetext="{value}{readout ? `, ${readout}` : ''}"
 		onpointerdown={down}
 		onpointermove={move}
 		onpointerup={up}
@@ -92,7 +99,7 @@
 		onlostpointercapture={up}
 		onwheel={wheel}
 		onkeydown={keydown}
-		ondblclick={reset}
+		ondblclick={() => onchange(initial)}
 		oncontextmenu={(event) => event.preventDefault()}
 	>
 		<svg viewBox="0 0 64 64" aria-hidden="true">
@@ -116,7 +123,7 @@
 		<span class="name">{name}</span>
 		<span class="cc">{param ? `CC ${cc}` : 'non mappé'}</span>
 	</button>
-	{#if param}<span class="readout">{readout}</span>{/if}
+	{#if readout}<span class="readout">{readout}</span>{/if}
 </div>
 
 <style>
